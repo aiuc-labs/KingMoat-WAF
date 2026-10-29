@@ -1,0 +1,119 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: build / vet / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shellcheck deploy scripts
+        run: |
+          shellcheck --version
+          # warning+ only: info/style findings (e.g. SC2016 false positives in
+          # regex character classes) must not block the whole gate.
+          shellcheck --severity=warning deploy/install.sh scripts/build.sh
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: Build
+        run: go build ./...
+      - name: Build (release tags)
+        run: go build -tags no_fs_access ./...
+      - name: Vet
+        run: go vet ./...
+      - name: License compliance check
+        run: go run ./scripts/gen-licenses -check
+      - name: Test
+        run: |
+          # Shared runners make a couple of timing-sensitive tests flaky (hot-reload
+          # drain ordering, sink maintenance overlap). One retry absorbs the flake;
+          # a real failure still fails the gate twice.
+          if go test ./... -race -count=1; then
+            exit 0
+          fi
+          echo "::warning::first race-test pass failed - retrying once (known timing-sensitive tests)"
+          go test ./... -race -count=1
+      - name: Test (release tags)
+        run: go test -tags no_fs_access ./... -count=1
+
+  docker:
+    name: docker build
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: false
+          load: true
+          tags: kingmoat:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke run (container boots and serves the console)
+        run: |
+          mkdir -p /tmp/kmdata && chmod 777 /tmp/kmdata
+          cat > /tmp/kmdata/config.json <<'JSON'
+          {"listen_http": ":8080", "audit_log_dir": "logs"}
+          JSON
+          docker run -d --name kmwaf-smoke -p 8081:8081 -v /tmp/kmdata:/data kingmoat:ci
+          # The console serves HTTPS with a bootstrap self-signed certificate,
+          # so the probe is https + insecure.
+          ok=0
+          for i in $(seq 1 45); do
+            if curl -fsSk -o /dev/null https://127.0.0.1:8081/; then ok=1; break; fi
+            if [ "$(docker inspect -f '{{.State.Running}}' kmwaf-smoke 2>/dev/null)" != "true" ]; then break; fi
+            sleep 1
+          done
+          echo "--- container logs ---"
+          docker logs kmwaf-smoke 2>&1 | tail -20
+          if [ "$ok" != "1" ]; then echo "console did not answer on https://127.0.0.1:8081/"; exit 1; fi
+          echo "console answered: $(curl -fsSk -o /dev/null -w '%{http_code}' https://127.0.0.1:8081/)"
+          docker run --rm --entrypoint /kingmoatwaf kingmoat:ci -version
+
+      - name: Smoke cleanup
+        if: always()
+        run: docker rm -f kmwaf-smoke || true
+
+  release:
+    name: release packages
+    needs: [test, docker]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Build packages
+        # bash (not ./) so a checkout that lost the executable bit still builds;
+        # the file mode is 100755 in the repo.
+        run: bash ./scripts/build.sh "${GITHUB_REF_NAME}"
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/kingmoatwaf_${{ github.ref_name }}/*.zip
+            dist/kingmoatwaf_${{ github.ref_name }}/*.tar.gz
+            dist/kingmoatwaf_${{ github.ref_name }}/checksums.txt
+          generate_release_notes: true

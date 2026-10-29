@@ -1,0 +1,1125 @@
+// Package proxy implements the KingMoat data plane core:
+// site routing 鈫?body buffering 鈫?detection pipeline 鈫?reverse proxy,
+// with atomic whole-state hot reload (docs/ARCHITECTURE.md 搂4.3).
+package proxy
+
+import (
+	context "context"
+	crand "crypto/rand"
+	"crypto/tls"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/kingmoat/kingmoat/internal/accesslog"
+	"github.com/kingmoat/kingmoat/internal/aisession"
+	"github.com/kingmoat/kingmoat/internal/apiasset"
+	"github.com/kingmoat/kingmoat/internal/config"
+	"github.com/kingmoat/kingmoat/internal/coraza"
+	"github.com/kingmoat/kingmoat/internal/geoip"
+	"github.com/kingmoat/kingmoat/internal/intercept"
+	"github.com/kingmoat/kingmoat/internal/ipgroups"
+	"github.com/kingmoat/kingmoat/internal/logstore"
+	"github.com/kingmoat/kingmoat/internal/metrics"
+	"github.com/kingmoat/kingmoat/internal/penalty"
+	"github.com/kingmoat/kingmoat/internal/pipeline"
+	"github.com/kingmoat/kingmoat/internal/stages"
+)
+
+// planeState is the immutable per-configuration runtime: router, pipeline
+// stages, response filter and their lifecycle handles. Reloads build a new
+// state and swap the pointer; in-flight requests keep their old state.
+type planeState struct {
+	cfg *config.Config
+	// revision is the config-center revision this state was built from
+	// (0 = unknown, e.g. static mode / plain New). Surfaced read-only via
+	// Handler.RunningRevision so /api/status can compare it against the
+	// latest published revision and warn on engine/config divergence.
+	revision   int64
+	router     *SiteRouter
+	pipe       *pipeline.Pipeline
+	respFilter *stages.RespFilter
+	authSite   *stages.SiteAuth
+	captcha    *stages.Captcha
+	penalty    *penalty.Manager
+	// geo is the geo blocking engine of THIS config build (nil in static /
+	// test mode). Exposed so the audit write path resolves geo_country from
+	// the same source the geo verdicts use (stages.Geo.ReaderForDomain);
+	// lifecycle is owned by state.closers like every other stage handle.
+	geo *stages.Geo
+	// disableState is the matcher-stage disable registry for THIS config
+	// build (fresh per publish); exposed read-only for the
+	// /api/policy/disable-state endpoint.
+	disableState *stages.StageDisableRegistry
+	closers      []io.Closer
+}
+
+func (s *planeState) close() {
+	for _, c := range s.closers {
+		_ = c.Close()
+	}
+}
+
+// Handler is the data plane request entry.
+type Handler struct {
+	state    atomic.Pointer[planeState]
+	audit    logstore.Store
+	logger   *slog.Logger
+	observer apiasset.TickSink
+	access   atomic.Pointer[accesslog.Sink]     // nil → access logging off
+	aiAudit  atomic.Pointer[aisession.Pipeline] // nil = AI session audit off
+
+	gmu   sync.Mutex
+	ipmgr *ipgroups.Manager
+	ipSig string
+	// logSampler throttles per-request warning logs under attack storms
+	// (audit records and the access log are never sampled).
+	logSampler *logSampler
+}
+
+// HealthSnapshot returns per-site upstream health from the CURRENT plane
+// state (site primary domain -> nodes). The embedded console (all-in-one)
+// reads it directly through the API server's SiteHealth option.
+func (h *Handler) HealthSnapshot() map[string][]NodeHealth {
+	st := h.state.Load()
+	if st == nil {
+		return nil
+	}
+	return st.router.HealthSnapshot()
+}
+
+// SetAccessSink wires the full access-log pipeline (nil disables it). Call
+// before serving traffic; the sink is process-wide, not per-config.
+func (h *Handler) SetAccessSink(sink accesslog.Sink) {
+	if sink == nil {
+		return
+	}
+	h.access.Store(&sink)
+}
+
+// SetAIAudit wires the AI session-audit pipeline (nil disables it). Because
+// the pipeline must reach buildRouter, an already-built state is reloaded
+// once so an enabled-at-boot pipeline takes effect immediately; later
+// publishes pick it up via Reload anyway. Hot swaps are safe: each request
+// loads the current pipeline.
+func (h *Handler) SetAIAudit(p *aisession.Pipeline) {
+	h.aiAudit.Store(p)
+	if old := h.state.Load(); old != nil && old.cfg != nil {
+		_ = h.Reload(old.cfg, old.revision)
+	}
+}
+
+// DisableState exposes the CURRENT config build's matcher disable registry
+// (fresh per publish) for the read-only /api/policy/disable-state endpoint.
+func (h *Handler) DisableState() *stages.StageDisableRegistry {
+	return h.state.Load().disableState
+}
+
+// ensureGroups returns the IP-group provider for cfg, reusing the existing
+// subscription manager when the group definitions did not change.
+func (h *Handler) ensureGroups(cfg *config.Config) ipgroups.Provider {
+	sig := groupSig(cfg.IPGroups)
+	h.gmu.Lock()
+	defer h.gmu.Unlock()
+	if h.ipmgr != nil && h.ipSig == sig {
+		return h.ipmgr
+	}
+	if h.ipmgr != nil {
+		_ = h.ipmgr.Close()
+	}
+	h.ipmgr = ipgroups.NewManager(cfg, h.logger)
+	h.ipSig = sig
+	return h.ipmgr
+}
+
+func groupSig(groups []config.IPGroupSettings) string {
+	if len(groups) == 0 {
+		return ""
+	}
+	b, _ := json.Marshal(groups)
+	return string(b)
+}
+
+// New builds the handler with an explicit pipeline (static / test / SDK
+// mode). Protection stages from site security configs are NOT assembled
+// here; use NewReloadable for managed mode.
+func New(cfg *config.Config, pipe *pipeline.Pipeline, audit logstore.Store, logger *slog.Logger) (*Handler, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if pipe == nil {
+		pipe = pipeline.New()
+	}
+	if audit == nil {
+		audit = logstore.Noop()
+	}
+	router, err := buildRouter(cfg, nil, logger, nil, nil, 0, nil)
+	if err != nil {
+		return nil, err
+	}
+	h := &Handler{audit: audit, logger: logger, logSampler: newLogSampler(logSampleLimitFromEnv())}
+	h.state.Store(&planeState{cfg: cfg, revision: 0, router: router, pipe: pipe})
+	return h, nil
+}
+
+// NewReloadable builds the handler from a full configuration, assembling all
+// protection stages (ACL 鈫?Geo 鈫?BotDetect 鈫?Bot/Captcha 鈫?rate limit 鈫?
+// semantic 鈫?Coraza/CRS) and the response filter. observer may be nil (the
+// access-tick side channel is disabled). Use Reload to hot-swap
+// configurations later.
+func NewReloadable(cfg *config.Config, audit logstore.Store, logger *slog.Logger) (*Handler, error) {
+	return NewReloadableObserved(cfg, audit, nil, logger)
+}
+
+// NewReloadableObserved is NewReloadable with the API-asset observer wired.
+func NewReloadableObserved(cfg *config.Config, audit logstore.Store, observer apiasset.TickSink, logger *slog.Logger) (*Handler, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if audit == nil {
+		audit = logstore.Noop()
+	}
+	h := &Handler{audit: audit, logger: logger, observer: observer, logSampler: newLogSampler(logSampleLimitFromEnv())}
+	groups := h.ensureGroups(cfg)
+	state, err := buildState(cfg, 0, groups, observer, logger, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	h.wirePenaltyHook(state.penalty)
+	h.state.Store(state)
+	return h, nil
+}
+
+// buildState materializes the whole runtime from a configuration. Any error
+// (bad CIDR, bad regex, WAF compile failure) aborts before anything is
+// published 鈥?the caller keeps the previous state (fail-static).
+func buildState(cfg *config.Config, rev int64, groups ipgroups.Provider, observer apiasset.TickSink, logger *slog.Logger, prevRouter *SiteRouter, aiPipe *aisession.Pipeline) (*planeState, error) {
+	// Aggregate body-buffer budget: refreshed on every build so
+	// body_buffer_budget_mb hot-applies on publish (and on boot).
+	bodyMem.setBudget(cfg.BodyBufferBudgetOrDefault())
+
+	state := &planeState{cfg: cfg, revision: rev}
+
+	acl, err := stages.NewACL(cfg, groups, logger)
+	if err != nil {
+		return nil, err
+	}
+	pen := penalty.New(penaltyPolicy(cfg), logger)
+	geo, err := stages.NewGeo(cfg, logger)
+	if err != nil {
+		return nil, err
+	}
+	// Register handles into state.closers the moment they are built: every
+	// later failure return below goes through state.close(), so nothing built
+	// before the failure leaks (the closers used to be appended only at the
+	// end, leaking geo/rl on any mid-build failure).
+	state.closers = append(state.closers, geo) // closes mmdb handles
+	captcha, err := stages.NewCaptcha(cfg, logger)
+	if err != nil {
+		state.close()
+		return nil, err
+	}
+	authSite, err := stages.NewSiteAuth(cfg, logger)
+	if err != nil {
+		state.close()
+		return nil, err
+	}
+	rl, err := stages.NewRateLimit(cfg, logger)
+	if err != nil {
+		state.close()
+		return nil, err
+	}
+	state.closers = append(state.closers, rl) // *RateLimit implements io.Closer
+	// The disable registry is shared by the matcher stage (writes site/module
+	// state on disable-rule hits) and the coraza stage (reads scoped
+	// coraza:<category> state to switch to variant engines).
+	registry := stages.NewStageDisableRegistry()
+	waf, err := coraza.New(cfg, logger)
+	if err != nil {
+		state.close()
+		return nil, err
+	}
+	waf.SetDisableGate(registry)
+	respFilter, err := stages.NewRespFilter(cfg, logger)
+	if err != nil {
+		state.close()
+		return nil, err
+	}
+	// Wire the observe-only sensitive-data hook into the asset collector
+	// (R1 signal) when the observer supports it.
+	if obs, ok := observer.(apiasset.HitObserver); ok {
+		respFilter.SetHitHook(obs.RespFilterHit)
+	}
+	semantic := stages.NewSemantic(cfg, logger)
+
+	// Pipeline order: ACL 鈫?Geo 鈫?BotDetect 鈫?(Captcha | Bot) 鈫?RateLimit 鈫?
+	// Semantic 鈫?CRS. BotDetect runs before the challenge stages so verified
+	// good bots can bypass the JS challenge and bad bots can be denied early.
+	var stageList []pipeline.Stage
+	stageList = append(stageList, acl, stages.NewPenalty(pen, logger), geo, stages.NewExceptions(cfg))
+	matcher, merr := stages.NewMatcher(cfg, registry, logger)
+	if merr != nil {
+		state.close()
+		return nil, merr
+	}
+	stageList = append(stageList, matcher)
+	var botStage *stages.BotChallenge
+	if !captchaEnabled(cfg) {
+		bot, err := stages.NewBotChallenge(cfg, logger)
+		if err != nil {
+			state.close()
+			return nil, err
+		}
+		botStage = bot
+	}
+	if detectErr := func() error {
+		detect, err := stages.NewBotDetect(cfg, botStage, logger)
+		if err != nil {
+			return err
+		}
+		stageList = append(stageList, detect)
+		return nil
+	}(); detectErr != nil {
+		state.close()
+		return nil, detectErr
+	}
+	if botStage != nil {
+		stageList = append(stageList, botStage)
+	} else if captcha != nil {
+		stageList = append(stageList, captcha)
+	}
+	stageList = append(stageList, rl, semantic, waf)
+
+	state.pipe = pipeline.New(stageList...)
+	state.pipe.SetGate(registry)
+	state.geo = geo
+	state.disableState = registry
+	state.penalty = pen
+	state.respFilter = respFilter
+	state.authSite = authSite
+	state.captcha = captcha
+	// geo and rl were registered into state.closers when built (see above).
+
+	sampleRate := 0.0
+	if cfg.ApiAssets != nil && cfg.ApiAssets.Enabled {
+		sampleRate = cfg.ApiAssets.Sample()
+	}
+	router, err := buildRouter(cfg, prevRouter, logger, respFilter, observer, sampleRate, aiPipe)
+	if err != nil {
+		state.close()
+		return nil, err
+	}
+	state.router = router
+	state.closers = append(state.closers, router) // stops pool health probers
+
+	// Interception-page copy follows the active configuration (settings page).
+	intercept.SetBlockPage(cfg.BlockPage)
+	return state, nil
+}
+
+func captchaEnabled(cfg *config.Config) bool {
+	for i := range cfg.Sites {
+		s := &cfg.Sites[i]
+		if s.Security != nil && s.Security.Captcha != nil && s.Security.Captcha.Enabled {
+			return true
+		}
+	}
+	return false
+}
+
+// wirePenaltyHook routes audit events into the penalty engine (SQLite store
+// only; other sinks keep their default behaviour).
+func (h *Handler) wirePenaltyHook(pen *penalty.Manager) {
+	if pen == nil {
+		return
+	}
+	if store, ok := h.audit.(*logstore.SQLiteStore); ok {
+		store.SetWriteHook(pen.Observe)
+	}
+}
+
+// penaltyPolicy extracts the penalty settings from the policy block.
+func penaltyPolicy(cfg *config.Config) config.PenaltySettings {
+	if cfg.Policy != nil && cfg.Policy.Penalty != nil {
+		return *cfg.Policy.Penalty
+	}
+	return config.PenaltySettings{}
+}
+
+// Reload hot-swaps to a new configuration. On any build error the current
+// state is kept untouched and the error is returned. rev is the config-center
+// revision the configuration belongs to (0 = unknown); it is recorded in the
+// swapped-in state and surfaced via RunningRevision.
+func (h *Handler) Reload(cfg *config.Config, rev int64) error {
+	groups := h.ensureGroups(cfg)
+	var prevRouter *SiteRouter
+	if old := h.state.Load(); old != nil && old.router != nil {
+		prevRouter = old.router // enable incremental adoption of unchanged sites
+	}
+	state, err := buildState(cfg, rev, groups, h.observer, h.logger, prevRouter, h.aiAudit.Load())
+	if err != nil {
+		metrics.Reloads.Inc("failed")
+		return err
+	}
+	h.wirePenaltyHook(state.penalty)
+	old := h.state.Swap(state)
+	// Defensive nil guard: Swap returns nil only for a handler whose state
+	// pointer was never stored (not possible via New/NewReloadable, but a
+	// zero-value Handler must not panic the reload). Previous-sites logging
+	// used to dereference old unconditionally here (len(old.cfg.Sites)).
+	prevSites := 0
+	if old != nil {
+		old.close()
+		prevSites = len(old.cfg.Sites)
+	}
+	metrics.Reloads.Inc("ok")
+	h.logger.Info("configuration reloaded",
+		"sites", len(cfg.Sites), "revision", rev, "revision_sites_prev", prevSites)
+	return nil
+}
+
+// SetRunningRevision stamps the boot state with the config-center revision it
+// was built from (all-in-one boot: the active revision at process start).
+// Reload-carried revisions supersede it on every later swap.
+func (h *Handler) SetRunningRevision(rev int64) {
+	if rev <= 0 {
+		return
+	}
+	st := h.state.Load()
+	if st == nil || st.revision == rev {
+		return
+	}
+	next := *st
+	next.revision = rev
+	h.state.Store(&next)
+}
+
+// RunningRevision returns the config-center revision the CURRENT data-plane
+// state was built from (0 = unknown, e.g. static mode).
+func (h *Handler) RunningRevision() int64 {
+	return h.state.Load().revision
+}
+
+// CurrentConfig returns the active configuration snapshot (for the API).
+func (h *Handler) CurrentConfig() *config.Config {
+	return h.state.Load().cfg
+}
+
+// GetCertificate exposes SNI certificate selection for the HTTPS listener.
+func (h *Handler) GetCertificate(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	return h.state.Load().router.CertificateFor(chi)
+}
+
+// TLSConfigFor applies per-site TLS behavior selected by SNI: the cipher
+// suite profile (strong / compatible) and the HTTP/2 negotiation switch.
+// Returning nil keeps the listener default (moderate profile, h2 + HTTP/1.1)
+// so the common case pays nothing extra per handshake.
+func (h *Handler) TLSConfigFor(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+	sr := h.state.Load().router.Match(chi.ServerName)
+	if sr == nil || sr.cfg == nil {
+		return nil, nil
+	}
+	override := config.CipherSuitesOverride(sr.cfg.TLSProfile)
+	h2 := sr.cfg.HTTP2Enabled == nil || *sr.cfg.HTTP2Enabled
+	if !override && h2 {
+		return nil, nil
+	}
+	out := &tls.Config{GetCertificate: h.GetCertificate}
+	if h2 {
+		out.NextProtos = []string{"h2", "http/1.1"}
+	} else {
+		out.NextProtos = []string{"http/1.1"}
+	}
+	if override {
+		out.MinVersion = tls.VersionTLS12
+		out.CipherSuites = config.CipherSuitesForProfile(sr.cfg.TLSProfile)
+	}
+	return out, nil
+}
+
+// clientSNIKey carries the original client SNI on the request context so an
+// SNI-forwarding upstream dial can reuse it (see sniForwardDial).
+type clientSNIKey struct{}
+
+// http2Enabled reports whether the site negotiates HTTP/2 (default true).
+func http2Enabled(s *config.Site) bool { return s.HTTP2Enabled == nil || *s.HTTP2Enabled }
+
+// ServeHTTP implements the request lifecycle (docs/ARCHITECTURE.md 搂3.1):
+// 鈶?site match 鈫?鈶?body buffering 鈫?鈶⑩懁鈶?pipeline 鈫?鈶?forward 鈫?鈶?response.
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	state := h.state.Load()
+
+	traceID := newTraceID()
+	r.Header.Set("X-KingMoat-Trace-Id", traceID)
+
+	// Original client SNI: published on the request context so an
+	// SNI-forwarding upstream dial can reuse it (config upstream.sni_forward).
+	if r.TLS != nil && r.TLS.ServerName != "" {
+		r = r.WithContext(context.WithValue(r.Context(), clientSNIKey{}, r.TLS.ServerName))
+	}
+
+	// Full access-log pipeline: capture status/bytes and emit one entry per
+	// request. Hot-path cost is one wrapper plus a bounded-queue send.
+	var accessSink *accesslog.Sink
+	if s := h.access.Load(); s != nil {
+		accessSink = s
+	}
+	var (
+		accessSite    string
+		accessOutcome = "forwarded"
+		accessRule    string
+	)
+	accessStart := time.Now()
+	// Byte accounting (site transferred-data panel): the recorder wraps the
+	// ResponseWriter UNCONDITIONALLY — whether an access-log entry is
+	// emitted stays the sink's own switch/sampling decision, but the down
+	// byte count must not depend on it (the wrapper costs one add per
+	// Write). Up bytes are the request-body reads (WAF inspection + the
+	// forwarded copy of the remainder = what the WAF actually received);
+	// WebSocket upgrades bypass the recorder via Hijack and are not
+	// counted (documented limitation).
+	accessRec := accesslog.NewRecorder(w)
+	w = accessRec
+	var upBytes atomic.Int64
+	var accessBodySkip string
+	var wd *bodyWatchdog
+	if r.Body != nil {
+		inner := r.Body
+		if wantsBody(r) {
+			// Body-read stall watchdog: aborts reads that make no progress
+			// for bodyIdleTimeout (unblocked via the connection read
+			// deadline) — armed only for body-bearing requests, disarmed at
+			// handler end (the forwarded remainder of an over-limit body
+			// stays covered because the wrapper stays in the body chain).
+			wd = newBodyWatchdog(accessRec)
+			defer wd.stop()
+			inner = wd.wrap(r.Body)
+		}
+		r.Body = &countBody{rc: inner, n: &upBytes}
+	}
+	defer func() {
+		metrics.SiteBytesInc(accessSite, int64(accessRec.BytesWritten()), upBytes.Load())
+		if accessSink == nil {
+			return
+		}
+		clientIP := resolvedOrPeerIP(r)
+		(*accessSink).Write(&accesslog.Entry{
+			TS:         time.Now().Format(time.RFC3339Nano),
+			TraceID:    traceID,
+			Site:       accessSite,
+			ClientIP:   clientIP,
+			Method:     r.Method,
+			Path:       r.URL.Path,
+			Query:      r.URL.RawQuery,
+			Status:     accessRec.Status(),
+			Bytes:      accessRec.BytesWritten(),
+			LatencyMS:  time.Since(accessStart).Milliseconds(),
+			UserAgent:  r.UserAgent(),
+			Outcome:    accessOutcome,
+			Rule:       accessRule,
+			AttackType: logstore.AttackTypeOf(accessRule),
+			BodySkip:   accessBodySkip,
+		})
+	}()
+
+	sr := state.router.Match(r.Host)
+	if sr == nil {
+		accessOutcome, accessRule = "blocked", "router/no_site"
+		if h.logSampler.Allow() {
+			h.logger.Warn("no site matched",
+				"host", r.Host, "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
+		}
+		v := pipeline.Deny("router/no_site", "no site matched for this host")
+		h.audit.Write(h.newEvent(r, "", v, "blocked", 0, nil))
+		metrics.RequestsTotal.Inc(r.Host, "blocked")
+		// Fixed empty label: the request Host is attacker-controlled and must
+		// not become an unbounded per-day counter label (filtered by the API).
+		metrics.DailyReqInc("", "blocked")
+		metrics.StageHits.Inc("router")
+		intercept.Deny(w, r, v, traceID)
+		return
+	}
+	site := firstDomain(sr.cfg)
+	accessSite = site
+
+	// Disabled site: take it out of rotation with an explicit block page
+	// (distinct from no_site so operators can tell the two apart).
+	if sr.cfg.Disabled {
+		v := pipeline.Deny("site/disabled", "site is disabled")
+		h.audit.Write(h.newEvent(r, site, v, "blocked", 0, nil))
+		metrics.RequestsTotal.Inc(r.Host, "blocked")
+		// Same fixed empty label as the no_site path above.
+		metrics.DailyReqInc("", "blocked")
+		metrics.StageHits.Inc("router")
+		intercept.Deny(w, r, v, traceID)
+		return
+	}
+
+	// Real-IP resolution (config.Site.RealIP): when the TCP peer is a
+	// trusted proxy, take the client address from the forwarding header and
+	// publish it on the request context. Every stage (ACL, GeoIP, rate
+	// limit, bot, matcher, WAF) and all logging below then see the resolved
+	// address instead of the LB/CDN peer.
+	if ip := stages.ResolveRealIP(sr.cfg, r); ip != nil {
+		r = r.WithContext(pipeline.WithClientIP(r.Context(), ip))
+	}
+
+	// Site-level HTTP鈫扝TTPS redirect: on the plain-HTTP listener, bounce to
+	// the HTTPS URL before any inspection (redirects carry no body to check).
+	// The ACME HTTP-01 path is exempt so certificate renewals keep working.
+	if r.TLS == nil && sr.cfg.RedirectToHTTPS && !strings.HasPrefix(r.URL.Path, "/.well-known/") {
+		accessOutcome, accessRule = "redirected", "redirect/https"
+		target := httpsRedirectURL(state.cfg.ListenHTTPS, r)
+		metrics.RequestsTotal.Inc(site, "redirected")
+		metrics.DailyReqInc(site, "redirected")
+		h.logger.Debug("http to https redirect", "site", site, "target", target, "trace", traceID)
+		h.audit.Write(h.newEvent(r, site, pipeline.Allow(), "redirected", 0, nil))
+		http.Redirect(w, r, target, http.StatusPermanentRedirect)
+		return
+	}
+
+	// Slider-captcha verification endpoint (handled before inspection so the
+	// unverified client can reach it).
+	if state.captcha != nil && strings.HasPrefix(r.URL.Path, stages.CaptchaVerifyPath) {
+		if state.captcha.HandleVerify(w, r) {
+			accessOutcome, accessRule = "challenged", "captcha/verify"
+			metrics.RequestsTotal.Inc(site, "challenged")
+			metrics.DailyReqInc(site, "challenged")
+			return
+		}
+	}
+
+	// Site-level Basic authentication (needs 401 + WWW-Authenticate, so it
+	// runs outside the verdict pipeline).
+	if state.authSite != nil {
+		if !state.authSite.Authorize(r) {
+			accessOutcome, accessRule = "blocked", "auth/basic"
+			v := pipeline.Deny("auth/basic", "authentication required")
+			v.Status = http.StatusUnauthorized
+			state.authSite.Challenge(w, r)
+			h.audit.Write(h.newEvent(r, site, v, "blocked", 0, nil))
+			metrics.RequestsTotal.Inc(site, "blocked")
+			metrics.DailyReqInc(site, "blocked")
+			metrics.StageHits.Inc("auth")
+			return
+		}
+	}
+
+	rc := &pipeline.RequestContext{
+		Request: r,
+		Site:    pipeline.SiteView{Domain: site, Monitor: !sr.cfg.Intercept()},
+		Values:  map[string]any{"trace_id": traceID},
+	}
+
+	// 鈶?Body buffering decision: buffer for inspection, reject, bypass
+	// (stream through, header-phase detection only) or stream (inspect the
+	// buffered prefix, forward the remainder untouched).
+	var bodyBytes int
+	// Effective over-limit behavior for THIS request path: a declared
+	// body_stream_paths prefix forces "stream" (upload endpoints exceed the
+	// site buffer with legitimate payloads) while undeclared paths keep the
+	// site-level reject/bypass behavior.
+	overMode := sr.cfg.WAF.OverLimitForPath(r.URL.Path)
+	if wantsBody(r) {
+		bo := bufferBody(r, sr.cfg, wd)
+		if bo.pool != nil {
+			defer recycle(bo.pool)
+		}
+		if bo.release != nil {
+			defer bo.release()
+		}
+		if bo.err != nil {
+			switch {
+			case errors.Is(bo.err, errBodyBudget):
+				// Aggregate buffer budget exhausted: fail-closed 503 so memory
+				// pressure can never silently downgrade body inspection.
+				v := pipeline.Deny("proxy/body_buffer_exhausted", "request body buffer budget exhausted")
+				v.Status = http.StatusServiceUnavailable
+				accessOutcome, accessRule = "blocked", "proxy/body_buffer_exhausted"
+				h.logger.Warn("request body buffer budget exhausted",
+					"site", site, "trace", traceID,
+					"content_length", r.ContentLength, "limit", sr.cfg.WAF.BodyLimit())
+				h.audit.Write(h.newEvent(r, site, v, "blocked", 0, nil))
+				metrics.RequestsTotal.Inc(site, "blocked")
+				metrics.DailyReqInc(site, "blocked")
+				metrics.StageHits.Inc("body_limit")
+				metrics.BodyGuardRejected.Inc(site)
+				intercept.Deny(w, r, v, traceID)
+				return
+			case errors.Is(bo.err, errBodyIdle):
+				// Stalled body read (no progress within the idle window): 408
+				// with an audit event — a deliberate slow-body probe is worth
+				// seeing in the attack log.
+				v := pipeline.Deny("proxy/body_idle", "request body read stalled")
+				v.Status = http.StatusRequestTimeout
+				accessOutcome, accessRule = "blocked", "proxy/body_idle"
+				h.logger.Warn("request body read stalled (idle timeout)",
+					"site", site, "trace", traceID, "idle_timeout", bodyIdleTimeout.String())
+				h.audit.Write(h.newEvent(r, site, v, "blocked", 0, nil))
+				metrics.RequestsTotal.Inc(site, "blocked")
+				metrics.DailyReqInc(site, "blocked")
+				metrics.StageHits.Inc("body_limit")
+				metrics.BodyIdleAborts.Inc(site)
+				intercept.Deny(w, r, v, traceID)
+				return
+			default:
+				// Client abort / I/O failure: 400 with truthful access-log
+				// semantics (previously outcome=forwarded, the same misread
+				// class the 413 path fixed). No audit event: ordinary
+				// client-side failures are not attack signals.
+				accessOutcome, accessRule = "blocked", "proxy/body_read"
+				h.logger.Warn("request body read failed", "trace", traceID, "err", bo.err)
+				http.Error(w, "Bad Request", http.StatusBadRequest)
+				return
+			}
+		}
+		if bo.over && overMode == "reject" {
+			v := pipeline.Deny("proxy/body_limit", "request body exceeds the inspection limit")
+			// 413 per the documented contract (config comment + docs/CONFIG.md):
+			// the generic Deny verdict defaults to 403, but an over-limit body
+			// is a payload-size condition, not a policy violation — clients and
+			// upstream apps (git push, large uploads) key off 413.
+			v.Status = http.StatusRequestEntityTooLarge
+			// Same access-log semantics as every other deny path: the request
+			// was in fact rejected, so it must not surface as outcome=forwarded
+			// with no rule (the historical misread during triage).
+			accessOutcome, accessRule = "blocked", "proxy/body_limit"
+			h.logger.Warn("request body over limit",
+				"site", site, "trace", traceID,
+				"content_length", r.ContentLength, "limit", sr.cfg.WAF.BodyLimit())
+			h.audit.Write(h.newEvent(r, site, v, "blocked", int(r.ContentLength), nil))
+			metrics.RequestsTotal.Inc(site, "blocked")
+			metrics.DailyReqInc(site, "blocked")
+			metrics.StageHits.Inc("body_limit")
+			intercept.Deny(w, r, v, traceID)
+			return
+		}
+		// Partial-inspection marker (engine window / over-limit pass): the
+		// skipped traffic stays auditable (access-log body_skip +
+		// kingmoat_body_bypass_total) for every shape that forwards without
+		// full inspection.
+		accessBodySkip = bo.skip
+		if bo.skip != "" {
+			metrics.BodyBypassTotal.Inc(site, bo.skip)
+		}
+		if !bo.over {
+			rc.Body = bo.data
+			bodyBytes = len(bo.data)
+		} else {
+			if overMode == "stream" {
+				// Stream policy: the buffered prefix participates in inspection
+				// while the remainder forwards untouched (r.Body was rewound to
+				// the full stream).
+				rc.Body = bo.data
+				bodyBytes = len(bo.data)
+				h.logger.Warn("request body over limit, streaming remainder",
+					"site", site, "trace", traceID,
+					"content_length", r.ContentLength, "inspected", len(bo.data))
+			}
+		}
+		// over && bypass: rc.Body stays nil; the stream was rewound intact.
+	}
+
+	// 鈶⑩懁 Detection pipeline: first non-allow verdict wins.
+	v := state.pipe.Inspect(r.Context(), rc)
+	switch v.Action {
+	case pipeline.ActionDeny:
+		accessRule = v.Rule
+		outcome := "blocked"
+		if sr.cfg.Intercept() {
+			accessOutcome = "blocked"
+			if h.logSampler.Allow() {
+				h.logger.Warn("request blocked",
+					"action", v.Action.String(), "rule", v.Rule, "reason", v.Reason,
+					"site", site, "trace", traceID,
+					"method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
+			}
+			if h.pipelineAuditAllowed(state.cfg, v, rc) {
+				h.audit.Write(h.newEvent(r, site, v, "blocked", bodyBytes, rc))
+			}
+			metrics.RequestsTotal.Inc(site, "blocked")
+			metrics.DailyReqInc(site, "blocked")
+			metrics.StageHits.Inc(stageOf(v.Rule))
+			intercept.Deny(w, r, v, traceID)
+			return
+		}
+		outcome = "monitor_forwarded"
+		accessOutcome = "monitor_forwarded"
+		if h.logSampler.Allow() {
+			h.logger.Info("monitor mode: deny verdict recorded, forwarding",
+				"action", v.Action.String(), "rule", v.Rule, "reason", v.Reason,
+				"site", site, "trace", traceID,
+				"method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
+		}
+		if h.pipelineAuditAllowed(state.cfg, v, rc) {
+			h.audit.Write(h.newEvent(r, site, v, "monitor", bodyBytes, rc))
+		}
+		metrics.RequestsTotal.Inc(site, outcome)
+		metrics.DailyReqInc(site, outcome)
+		metrics.StageHits.Inc(stageOf(v.Rule))
+
+	case pipeline.ActionChallenge:
+		accessRule = v.Rule
+		if sr.cfg.Intercept() {
+			accessOutcome = "challenged"
+			cookieName, _ := rc.Values["challenge_cookie"].(string)
+			if kind, _ := rc.Values["challenge_kind"].(string); kind == "slider" {
+				pageHTML, _ := rc.Values["challenge_html"].(string)
+				if h.logSampler.Allow() {
+					h.logger.Info("slider challenge issued",
+						"site", site, "trace", traceID, "remote", r.RemoteAddr)
+				}
+				if !trustedFlow(rc) {
+					h.audit.Write(h.newEvent(r, site, v, "challenged", bodyBytes, rc))
+				}
+				metrics.RequestsTotal.Inc(site, "challenged")
+				metrics.DailyReqInc(site, "challenged")
+				metrics.StageHits.Inc("captcha")
+				intercept.SliderChallenge(w, pageHTML)
+				return
+			}
+			token, _ := rc.Values["challenge_token"].(string)
+			if h.logSampler.Allow() {
+				h.logger.Info("bot challenge issued",
+					"site", site, "trace", traceID, "remote", r.RemoteAddr)
+			}
+			if !trustedFlow(rc) {
+				h.audit.Write(h.newEvent(r, site, v, "challenged", bodyBytes, rc))
+			}
+			metrics.RequestsTotal.Inc(site, "challenged")
+			metrics.DailyReqInc(site, "challenged")
+			metrics.StageHits.Inc("bot")
+			intercept.Challenge(w, cookieName, token)
+			return
+		}
+		// Monitor mode: challenges are recorded but not enforced.
+		accessOutcome = "monitor_forwarded"
+		if !trustedFlow(rc) {
+			h.audit.Write(h.newEvent(r, site, v, "monitor", bodyBytes, rc))
+		}
+		metrics.RequestsTotal.Inc(site, "monitor_forwarded")
+		metrics.DailyReqInc(site, "monitor_forwarded")
+	}
+
+	// Micro-engine rule hit audit (allow/monitor/disable actions): when the
+	// matched rule opts in to logging (log_enabled), write one monitor-action
+	// event carrying the "matcher/<name>" identifier so the console can
+	// drill down per rule. Disable hits follow the same toggle (the console
+	// defaults it to on for disable rules); deny verdicts are handled in the
+	// case above.
+	if v.Action == pipeline.ActionAllow {
+		if name, ok := rc.Values["matcher_rule"].(string); ok && name != "" && matcherLogEnabled(state.cfg, name) {
+			ev := pipeline.Verdict{Action: pipeline.ActionAllow, Rule: "matcher/" + name}
+			if action, _ := rc.Values["matcher_action"].(string); action == config.ActionDisable {
+				stagesOff, _ := rc.Values["matcher_disable_stages"].(string)
+				ev.Reason = "disable rule hit: switched off " + stagesOff + " for site (applies to subsequent requests until republish)"
+			} else {
+				ev.Reason = "matched custom rule: " + name
+			}
+			h.audit.Write(h.newEvent(r, site, ev, "monitor", bodyBytes, rc))
+		}
+		// Geo engine-missing audit (allow path, same bypass pattern as
+		// matcher_rule above): the geo stage flags requests to a site whose
+		// config declares geo but the running engine has no mapping for it.
+		// Unreachable by construction in today's builds (the geo stage writes
+		// byDomain and its configured set in the same loop): kept as a
+		// defensive fail-open sentinel — if a future refactor makes the
+		// desync real, each fired flag leaves one non-blocking audit event so
+		// the silent fail-open cannot hide. The flag follows the stage's warn
+		// rate limit (one per domain per minute), so this cannot flood the
+		// audit store.
+		if _, missing := rc.Values["geo_engine_missing"]; missing {
+			ev := pipeline.Verdict{
+				Action: pipeline.ActionAllow,
+				Rule:   "geo/engine_missing",
+				Reason: "geo engine missing for a configured site: the running engine predates the configuration (check hot-reload failures); request allowed without geo evaluation",
+			}
+			h.audit.Write(h.newEvent(r, site, ev, "monitor", bodyBytes, rc))
+		}
+	}
+
+	// Forward upstream; response pipeline runs in ModifyResponse. The
+	// access-tick side channel reads the bot label and buffered-body parameter
+	// names from the request context (observer nil means no-op).
+	if h.observer != nil {
+		ctx := r.Context()
+		if bc, _ := rc.Values["bot_class"].(string); bc != "" {
+			ctx = context.WithValue(ctx, botClassKey, bc)
+		}
+		if rc.Body != nil {
+			if keys := apiasset.JSONTopKeys(rc.Body, bodyKeyMaxBytes); len(keys) > 0 {
+				ctx = context.WithValue(ctx, bodyKeysKey, keys)
+			}
+		}
+		r = r.WithContext(ctx)
+	}
+	// AI session-audit side channel: identify LLM traffic before forwarding
+	// and stash the capture context for ModifyResponse (pipeline nil = off).
+	if p := h.aiAudit.Load(); p != nil && p.Enabled() {
+		if cc := p.CaptureRequest(rc, r, site, r.Header.Get("X-KingMoat-Trace-Id")); cc != nil {
+			r = r.WithContext(context.WithValue(r.Context(), aiCaptureKey, cc))
+		}
+	}
+	sr.px.ServeHTTP(w, r)
+	metrics.RequestsTotal.Inc(site, "forwarded")
+	metrics.DailyReqInc(site, "forwarded")
+}
+
+// resolvedOrPeerIP returns the real client IP when the proxy resolved one
+// (config.Site.RealIP) for this request, otherwise the TCP peer address.
+func resolvedOrPeerIP(r *http.Request) string {
+	if ip := pipeline.ClientIPFromContext(r.Context()); ip != nil {
+		return ip.String()
+	}
+	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if clientIP == "" {
+		clientIP = r.RemoteAddr
+	}
+	return clientIP
+}
+
+// trustedFlow reports whether an earlier pipeline stage marked the request
+// as operator-allowed (ACL whitelist, matcher allow, whole-path exception,
+// or geo whitelist with whitelist_trusted). Pipeline-derived audit events
+// are skipped for trusted flows: writing them would recreate exactly the
+// noise the operator silenced — and worse, denied events would re-feed the
+// penalty counters, keeping the whitelisted IP banned indefinitely.
+func trustedFlow(rc *pipeline.RequestContext) bool {
+	if rc == nil {
+		return false
+	}
+	trusted, ok := rc.Values["trusted"].(bool)
+	return ok && trusted
+}
+
+// matcherRuleOf extracts the rule name from a "matcher/<name>" verdict rule
+// identifier; "" for any other (non-micro-engine) rule.
+func matcherRuleOf(rule string) string {
+	if name, ok := strings.CutPrefix(rule, "matcher/"); ok {
+		return name
+	}
+	return ""
+}
+
+// matcherLogEnabled reports whether the named micro-engine rule is configured
+// to write audit events (config.Policy.Matchers[].log_enabled). Unknown rules
+// (deleted, or read across a config reload) default to false: audit off.
+func matcherLogEnabled(cfg *config.Config, name string) bool {
+	if cfg == nil || cfg.Policy == nil || name == "" {
+		return false
+	}
+	for i := range cfg.Policy.Matchers {
+		if cfg.Policy.Matchers[i].Name == name {
+			return cfg.Policy.Matchers[i].LogEnabled
+		}
+	}
+	return false
+}
+
+// pipelineAuditAllowed gates the deny/challenge audit write points: the
+// event is written when the request is not a trusted flow AND the verdict's
+// rule opts in to logging. Non-matcher rules always log (existing behavior);
+// micro-engine rules log only when their per-rule log_enabled toggle is on,
+// so a rule with logging disabled is still enforced (and counted) but
+// produces no audit events.
+func (h *Handler) pipelineAuditAllowed(cfg *config.Config, v pipeline.Verdict, rc *pipeline.RequestContext) bool {
+	if trustedFlow(rc) {
+		return false
+	}
+	if name := matcherRuleOf(v.Rule); name != "" {
+		return matcherLogEnabled(cfg, name)
+	}
+	return true
+}
+
+func (h *Handler) newEvent(r *http.Request, site string, v pipeline.Verdict, action string, bodyBytes int, rc *pipeline.RequestContext) *logstore.Event {
+	clientIP := resolvedOrPeerIP(r)
+	st := h.state.Load()
+	ev := &logstore.Event{
+		TraceID:  r.Header.Get("X-KingMoat-Trace-Id"),
+		Site:     site,
+		ClientIP: clientIP,
+		// Attack-path only (not the per-request hot path); resolution is
+		// memory-resident and private origins skip the lookup entirely.
+		// Same source as the geo blocking stage and the /api/stats/geo
+		// aggregation: the geo stage's own per-request result when it ran,
+		// else the site geo engine's reader, else the embedded database.
+		GeoCountry: h.geoCountry(st, site, clientIP, rc),
+		Method:     r.Method,
+		Path:       r.URL.Path,
+		URL:        r.Host + r.URL.RequestURI(),
+		UserAgent:  r.UserAgent(),
+		Action:     action,
+		Rule:       v.Rule,
+		AttackType: logstore.AttackTypeOf(v.Rule),
+		Reason:     v.Reason,
+		Status:     v.Status,
+		BodyBytes:  bodyBytes,
+	}
+	if rc != nil {
+		ev.BotClass, ev.BotName, ev.BotScore = stages.BotLabels(rc)
+	}
+	// st/st.cfg nil defense matches geoCountry above: planeState is nil
+	// before the first build or in a broken start-up window, and cfg can be
+	// nil in degenerate states. Comparison only — no hot-path allocation.
+	if action != "" && st != nil && st.cfg != nil && st.cfg.CaptureRequests {
+		captureInto(ev, r, rc)
+	}
+	return ev
+}
+
+// geoCountry resolves an audit event's geo_country with the same source the
+// geo blocking stage used for this request:
+//
+//  1. the geo stage's own per-request result (rc.Values["geo_country"],
+//     written by stages/geo.go on every successful lookup — empty string
+//     included, "" stays the terminal no-country value);
+//  2. otherwise the site geo engine's reader via geoip.LookupCountryWith —
+//     covers requests that never reached the geo stage (earlier-stage
+//     denials, trusted flows, stage-gated sites, rc-less early events);
+//  3. otherwise the embedded database (non-geo sites, static/test mode),
+//     keeping the pre-existing behavior exactly.
+//
+// No site geo engine means no site custom database, so branch 3 IS the
+// "no custom db" branch of the same-source contract. The fallback lookups
+// run on the audit write path only (never the per-request hot path) and no
+// branch opens a second copy of any database.
+func (h *Handler) geoCountry(st *planeState, site, clientIP string, rc *pipeline.RequestContext) string {
+	if rc != nil {
+		if cc, ok := rc.Values["geo_country"].(string); ok {
+			return cc
+		}
+	}
+	if st != nil && st.geo != nil && site != "" {
+		if r := st.geo.ReaderForDomain(site); r != nil {
+			return geoip.LookupCountryWith(r, clientIP)
+		}
+	}
+	return geoip.LookupCountry(clientIP)
+}
+
+// sensitiveHeaders are redacted before a request snapshot is stored.
+var sensitiveHeaders = map[string]bool{
+	"authorization": true, "cookie": true, "set-cookie": true,
+	"proxy-authorization": true, "x-api-key": true,
+}
+
+const bodySampleLimit = 2048
+
+// bodyKeyMaxBytes caps JSON body key sampling for the asset side channel.
+const bodyKeyMaxBytes = 64 << 10
+
+func captureInto(ev *logstore.Event, r *http.Request, rc *pipeline.RequestContext) {
+	headers := map[string]string{}
+	for k, vs := range r.Header {
+		val := strings.Join(vs, ", ")
+		if sensitiveHeaders[strings.ToLower(k)] {
+			val = "***"
+		}
+		headers[k] = val
+	}
+	ev.Headers = headers
+	if rc != nil && len(rc.Body) > 0 {
+		sample := rc.Body
+		if len(sample) > bodySampleLimit {
+			sample = sample[:bodySampleLimit]
+		}
+		ev.Body = redactSensitiveValues(string(sample))
+	}
+}
+
+// sensitiveValueKeys are JSON/form keys whose values must never be stored in
+// request-body snapshots (capture_requests enabled).
+var sensitiveValueKeys = []string{
+	"password", "passwd", "pwd", "secret", "token", "api_key", "apikey",
+	"access_key", "accesskey", "private_key", "credential", "session",
+}
+
+// redactSensitiveValues masks values of sensitive keys in a JSON or
+// form-encoded body sample (privacy: capture_requests must never store
+// credentials at rest).
+func redactSensitiveValues(body string) string {
+	// JSON: naive but safe value masking for known keys
+	for _, key := range sensitiveValueKeys {
+		for _, pat := range []string{
+			`"` + key + `":"`,  // JSON key
+			`"` + key + `": "`, // JSON key with space
+			key + `=`,          // form-encoded key
+		} {
+			idx := strings.Index(strings.ToLower(body), strings.ToLower(pat))
+			if idx < 0 {
+				continue
+			}
+			start := idx + len(pat)
+			end := start
+			for end < len(body) {
+				ch := body[end]
+				if ch == '"' || ch == '&' || ch == ',' || ch == '}' || ch == '\n' {
+					break
+				}
+				end++
+			}
+			if end > start {
+				body = body[:start] + "***" + body[end:]
+			}
+		}
+	}
+	return body
+}
+
+func firstDomain(s *config.Site) string {
+	if len(s.Domains) > 0 {
+		return s.Domains[0]
+	}
+	return ""
+}
+
+// httpsRedirectURL builds the HTTPS target for a 308 redirect. The target
+// keeps the request path and query; the host comes from the request and the
+// port from the global listen_https (omitted when it is the default 443).
+func httpsRedirectURL(listenHTTPS string, r *http.Request) string {
+	port := ""
+	if _, p, err := net.SplitHostPort(listenHTTPS); err == nil && p != "" && p != "443" {
+		port = ":" + p
+	}
+	host := r.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	u := *r.URL
+	u.Scheme = "https"
+	u.Host = host + port
+	return u.String()
+}
+
+// stageOf extracts the stage name from a rule identifier "<stage>/<rule>".
+func stageOf(rule string) string {
+	for i := 0; i < len(rule); i++ {
+		if rule[i] == '/' {
+			return rule[:i]
+		}
+	}
+	return rule
+}
+
+func newTraceID() string {
+	var b [8]byte
+	_, _ = crand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+// Groups exposes the live IP-group subscription manager (console IP-group
+// management UI). Returns nil when no groups are configured.
+func (h *Handler) Groups() *ipgroups.Manager {
+	h.gmu.Lock()
+	defer h.gmu.Unlock()
+	return h.ipmgr
+}

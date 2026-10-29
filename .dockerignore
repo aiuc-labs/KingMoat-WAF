@@ -1,0 +1,6 @@
+.git
+.github
+dist/
+web/console/node_modules/
+coverage.out
+coverage.html

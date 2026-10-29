@@ -1,0 +1,60 @@
+[Unit]
+Description=KingMoat WAF (all-in-one: data plane + console)
+Documentation=https://github.com/kingmoat/KingMoat-WAF
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kingmoat
+Group=kingmoat
+# Non-root privileged-port binding: only CAP_NET_BIND_SERVICE is granted
+# (for listen_http/listen_https on 80/443); no other capabilities survive.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# StateDirectory creates /var/lib/kingmoatwaf with correct ownership and keeps
+# it writable despite ProtectSystem=strict (config DB, audit logs, cert
+# library, acme-cache all live there). ConfigurationDirectory covers
+# /etc/kingmoatwaf.
+StateDirectory=kingmoatwaf
+ConfigurationDirectory=kingmoatwaf
+WorkingDirectory=/var/lib/kingmoatwaf
+# Console admin password hash (argon2id): generate with `kmwafctl hash-password -stdin`
+# and drop it into /etc/kingmoatwaf/env as KMWAF_ADMIN_HASH=...
+# (optional: KMWAF_ADMIN_TOTP=<base32>, KMWAF_AI_API_KEY=<provider key>)
+# Legacy KINGMOAT_* names are still read as a fallback.
+# If the hash is unset, console auth is still enforced: the bootstrap account is
+# kmadmin, its initial password comes from KMWAF_BOOTSTRAP_PASSWORD or a random
+# one written to <data dir>/initial-admin-password.txt (password change forced
+# at first login).
+EnvironmentFile=-/etc/kingmoatwaf/env
+# Console port (CONSOLE_PORT): the in-console port change (settings page)
+# rewrites this file and restarts the unit. Create it before first start:
+#   echo CONSOLE_PORT=8443 | sudo tee /var/lib/kingmoatwaf/console.env
+#   sudo chmod 600 /var/lib/kingmoatwaf/console.env
+# If it is missing the unit fails to start (keep the dash prefix removed for
+# fail-fast behavior; restore the value as shown above to recover).
+EnvironmentFile=/var/lib/kingmoatwaf/console.env
+# -config            seed config, imported on first boot; live config lives in the console DB
+# -console-addr      embedded console (Web UI + /api/* + /metrics); HTTPS by default
+#                    (self-signed bootstrap cert; replace from the console settings);
+#                    the port is expanded by systemd from the EnvironmentFile above
+# -console-db        SQLite config store; keep on a LOCAL disk, never on NFS/SMB
+# Self-healing rollback for interrupted online upgrades: compares the
+# running binary against the recorded upgrade intent and restores the
+# backup if the new binary failed to boot. The command itself never
+# fails (exit 0 when no intent / intent satisfied / files missing), and
+# the leading "-" makes systemd ignore its exit code even if the binary
+# itself is missing - startup must never be blocked by this hook.
+ExecStartPre="-/usr/local/bin/kmwafctl" upgrade-rollback -data-dir /var/lib/kingmoatwaf
+ExecStart=/usr/local/bin/kingmoatwaf -config /etc/kingmoatwaf/config.json -console-addr 127.0.0.1:${CONSOLE_PORT} -console-db /var/lib/kingmoatwaf/kingmoatwaf.db
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
