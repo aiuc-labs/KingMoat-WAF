@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/images/logo.svg" alt="KingMoat WAF" width="128" height="128">
+</p>
+
 <h1 align="center">KingMoat WAF</h1>
 
 <p align="center">
