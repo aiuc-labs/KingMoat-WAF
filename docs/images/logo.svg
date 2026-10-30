@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="KM block">
+  <defs>
+    <mask id="kmCut">
+      <rect x="44" y="44" width="424" height="424" rx="88" fill="#ffffff"/>
+      <rect x="180" y="148" width="46" height="216" fill="#000000"/>
+      <path d="M226 210 L334 148 L334 194 L226 256 Z" fill="#000000"/>
+      <path d="M226 256 L334 318 L334 364 L226 302 Z" fill="#000000"/>
+    </mask>
+  </defs>
+  <rect x="44" y="44" width="424" height="424" rx="88" fill="#0F172A" mask="url(#kmCut)"/>
+</svg>
